@@ -80,7 +80,10 @@ func loadDERPMapFromURL(addr url.URL) (*tailcfg.DERPMap, error) {
 func mergeDERPMaps(derpMaps []*tailcfg.DERPMap) *tailcfg.DERPMap {
 	result := tailcfg.DERPMap{
 		OmitDefaultRegions: false,
-		Regions:            map[int]*tailcfg.DERPRegion{},
+		HomeParams: &tailcfg.DERPHomeParams{
+			RegionScore: map[int]float64{},
+		},
+		Regions: map[int]*tailcfg.DERPRegion{},
 	}
 
 	for _, derpMap := range derpMaps {
@@ -90,11 +93,23 @@ func mergeDERPMaps(derpMaps []*tailcfg.DERPMap) *tailcfg.DERPMap {
 		for id, region := range derpMap.Regions {
 			result.Regions[id] = region.Clone()
 		}
+
+		if derpMap.HomeParams != nil {
+			for id, regionScore := range derpMap.HomeParams.RegionScore {
+				result.HomeParams.RegionScore[id] = regionScore
+			}
+		}
 	}
 
 	for id, region := range result.Regions {
 		if region == nil {
 			delete(result.Regions, id)
+		}
+	}
+
+	for id, regionScore := range result.HomeParams.RegionScore {
+		if regionScore <= 0 {
+			delete(result.HomeParams.RegionScore, id)
 		}
 	}
 
