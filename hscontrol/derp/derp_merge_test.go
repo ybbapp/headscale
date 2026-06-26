@@ -26,3 +26,29 @@ func TestMergeDERPMapsClonesRegions(t *testing.T) {
 	assert.Equal(t, "a", src.Regions[1].Nodes[0].Name,
 		"source region was mutated through a shared pointer")
 }
+
+func TestMergeDERPMapsMergesHomeParams(t *testing.T) {
+	merged := mergeDERPMaps([]*tailcfg.DERPMap{
+		{
+			HomeParams: &tailcfg.DERPHomeParams{
+				RegionScore: map[int]float64{
+					1: 0.5,
+					2: 1.5,
+				},
+			},
+		},
+		{
+			HomeParams: &tailcfg.DERPHomeParams{
+				RegionScore: map[int]float64{
+					2: 0,
+					3: 2,
+				},
+			},
+		},
+	})
+
+	assert.Equal(t, map[int]float64{
+		1: 0.5,
+		3: 2,
+	}, merged.HomeParams.RegionScore)
+}
