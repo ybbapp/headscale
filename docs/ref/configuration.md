@@ -60,7 +60,12 @@ a download at startup and then at `update_interval`; failed or invalid updates
 leave the last valid database in use. Configure a different source URL if your
 deployment uses another provider. Without a valid local database or successful
 download, GeoIP lookups return no country and regional routing falls back to
-DERP RTT.
+DERP RTT. While no valid database is available, Headscale retries from 5 minutes
+after the failed startup download, doubling the delay up to 6 hours. A successful
+download switches back to the configured refresh interval. Startup and retry
+logs include the database path, outcome, and next retry delay without logging
+the source URL. If `source_url` is explicitly empty, automatic downloads and
+retries are disabled; a valid local database is then required for GeoIP.
 
 Regional router fallback order is optional and configured by viewer country
 when GeoIP is active, or by `DERP-<region-id>` when using RTT regions. Country

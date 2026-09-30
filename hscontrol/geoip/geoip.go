@@ -21,7 +21,11 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
-const maxDatabaseSize = 100 << 20
+const (
+	maxDatabaseSize           = 100 << 20
+	initialGeoIPRetryInterval = 5 * time.Minute
+	maxGeoIPRetryInterval     = 6 * time.Hour
+)
 
 var nonPublicPrefixes = []netip.Prefix{
 	netip.MustParsePrefix("0.0.0.0/8"),
@@ -87,17 +91,28 @@ func Open(cfg types.GeoIPConfig) (*Reader, error) {
 
 	if db, err := maxminddb.Open(cfg.DatabasePath); err == nil {
 		r.db = db
+	} else if cfg.SourceURL != "" {
+		log.Info().Err(err).Str("path", cfg.DatabasePath).
+			Msg("GeoIP database unavailable locally; attempting startup download")
 	} else {
-		log.Warn().Err(err).Msg("GeoIP database is unavailable; country lookup will use fallback")
+		log.Warn().Err(err).Str("path", cfg.DatabasePath).
+			Msg("GeoIP database unavailable and no source_url configured; country lookup will use DERP fallback")
 	}
 
 	if cfg.SourceURL != "" {
 		if err := r.update(context.Background()); err != nil {
-			log.Warn().Err(err).Msg("GeoIP database update failed; retaining last good database")
+			retryIn := cfg.UpdateInterval
+			if !r.hasDatabase() {
+				retryIn = initialGeoIPRetryInterval
+			}
+			r.logUpdateFailure(err, retryIn)
+		} else {
+			log.Info().Str("path", cfg.DatabasePath).
+				Msg("GeoIP startup download and validation succeeded")
 		}
 	}
 
-	if cfg.SourceURL != "" && cfg.UpdateInterval > 0 {
+	if cfg.SourceURL != "" && (cfg.UpdateInterval > 0 || !r.hasDatabase()) {
 		ctx, cancel := context.WithCancel(context.Background())
 		r.cancel = cancel
 		r.done = make(chan struct{})
@@ -161,18 +176,74 @@ func (r *Reader) Close() error {
 
 func (r *Reader) updateLoop(ctx context.Context) {
 	defer close(r.done)
-	ticker := time.NewTicker(r.cfg.UpdateInterval)
-	defer ticker.Stop()
+	delay := r.cfg.UpdateInterval
+	if !r.hasDatabase() {
+		delay = initialGeoIPRetryInterval
+	}
+
 	for {
+		timer := time.NewTimer(delay)
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			return
-		case <-ticker.C:
-			if err := r.update(ctx); err != nil {
-				log.Warn().Err(err).Msg("GeoIP database update failed; retaining last good database")
-			}
+		case <-timer.C:
 		}
+
+		if err := r.update(ctx); err != nil {
+			if r.hasDatabase() {
+				if r.cfg.UpdateInterval <= 0 {
+					return
+				}
+				delay = r.cfg.UpdateInterval
+			} else {
+				delay = nextGeoIPRetryInterval(delay)
+			}
+			r.logUpdateFailure(err, delay)
+			continue
+		}
+
+		log.Info().Str("path", r.cfg.DatabasePath).
+			Msg("GeoIP scheduled database refresh succeeded")
+		if r.cfg.UpdateInterval <= 0 {
+			return
+		}
+		delay = r.cfg.UpdateInterval
 	}
+}
+
+func (r *Reader) logUpdateFailure(err error, retryIn time.Duration) {
+	if r.hasDatabase() {
+		if retryIn <= 0 {
+			log.Warn().Err(err).Str("path", r.cfg.DatabasePath).
+				Msg("GeoIP database update failed; retaining last good database; periodic updates are disabled")
+			return
+		}
+		log.Warn().Err(err).Str("path", r.cfg.DatabasePath).Dur("retry_in", retryIn).
+			Msg("GeoIP database update failed; retaining last good database and retrying")
+		return
+	}
+
+	log.Warn().Err(err).Str("path", r.cfg.DatabasePath).Dur("retry_in", retryIn).
+		Msg("GeoIP database unavailable; using DERP fallback until a download retry succeeds")
+}
+
+func nextGeoIPRetryInterval(current time.Duration) time.Duration {
+	if current < initialGeoIPRetryInterval {
+		return initialGeoIPRetryInterval
+	}
+	if current >= maxGeoIPRetryInterval/2 {
+		return maxGeoIPRetryInterval
+	}
+
+	return current * 2
+}
+
+func (r *Reader) hasDatabase() bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	return r.db != nil
 }
 
 func (r *Reader) update(ctx context.Context) error {

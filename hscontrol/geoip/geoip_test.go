@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/stretchr/testify/require"
@@ -89,6 +90,20 @@ func TestOpenWithoutDatabaseKeepsGeoIPAvailableAsFallback(t *testing.T) {
 	country, ok := reader.LookupCountry(netip.MustParseAddr("8.8.8.8"))
 	require.False(t, ok)
 	require.Empty(t, country)
+}
+
+func TestNextGeoIPRetryInterval(t *testing.T) {
+	for _, tt := range []struct {
+		current time.Duration
+		want    time.Duration
+	}{
+		{current: 0, want: initialGeoIPRetryInterval},
+		{current: initialGeoIPRetryInterval, want: 10 * time.Minute},
+		{current: 3 * time.Hour, want: maxGeoIPRetryInterval},
+		{current: maxGeoIPRetryInterval, want: maxGeoIPRetryInterval},
+	} {
+		require.Equal(t, tt.want, nextGeoIPRetryInterval(tt.current))
+	}
 }
 
 func TestFailedUpdateKeepsLastGoodDatabase(t *testing.T) {
