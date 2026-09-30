@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
@@ -263,6 +264,98 @@ func TestReadConfig(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestLoadServerConfigGeoIP(t *testing.T) {
+	viper.Reset()
+	t.Cleanup(viper.Reset)
+	require.NoError(t, LoadConfig(t.TempDir(), false))
+	viper.Set("prefixes.v4", "100.64.0.0/10")
+	viper.Set("prefixes.v6", "fd7a:115c:a1e0::/48")
+	viper.Set("server_url", "http://127.0.0.1:8080")
+	viper.Set("dns.magic_dns", false)
+	viper.Set("dns.base_domain", "example.test")
+	viper.Set("noise.private_key_path", "noise.key")
+	viper.Set("dns.override_local_dns", false)
+	viper.Set("database.type", "sqlite")
+	viper.Set("tls_letsencrypt_challenge_type", HTTP01ChallengeType)
+	viper.Set("node.ephemeral.inactivity_timeout", "120s")
+	viper.Set("geoip.enabled", true)
+	viper.Set("geoip.database_path", "geo/country.mmdb")
+	viper.Set("geoip.source_url", "https://geo.example/country.mmdb")
+	viper.Set("geoip.update_interval", "12h")
+	viper.Set("node.routes.regional_routing.fallback_regions", map[string][]string{
+		"DE": {"FR", "NL"},
+	})
+
+	cfg, err := LoadServerConfig()
+	require.NoError(t, err)
+	require.True(t, cfg.GeoIP.Enabled)
+	assert.Equal(t, "geo/country.mmdb", cfg.GeoIP.DatabasePath)
+	assert.Equal(t, "https://geo.example/country.mmdb", cfg.GeoIP.SourceURL)
+	assert.Equal(t, 12*time.Hour, cfg.GeoIP.UpdateInterval)
+	assert.Equal(t, map[string][]string{"DE": {"FR", "NL"}}, cfg.Node.Routes.RegionalRouting.FallbackRegions)
+}
+
+func TestGeoIPConfigDefaults(t *testing.T) {
+	viper.Reset()
+	t.Cleanup(viper.Reset)
+	require.NoError(t, LoadConfig(t.TempDir(), false))
+	assert.False(t, viper.GetBool("geoip.enabled"))
+	assert.Equal(t, "/var/lib/headscale/GeoLite2-Country.mmdb", viper.GetString("geoip.database_path"))
+	assert.Equal(t, 72*time.Hour, viper.GetDuration("geoip.update_interval"))
+	assert.Equal(t, "https://raw.githubusercontent.com/P3TERX/GeoLite.mmdb/download/GeoLite2-Country.mmdb", viper.GetString("geoip.source_url"))
+}
+
+func TestValidateServerConfigRejectsMalformedFallbackCountry(t *testing.T) {
+	viper.Reset()
+	t.Cleanup(viper.Reset)
+	viper.Set("server_url", "http://127.0.0.1:8080")
+	viper.Set("noise.private_key_path", "noise.key")
+	viper.Set("dns.override_local_dns", false)
+	viper.Set("node.ephemeral.inactivity_timeout", "120s")
+	viper.Set("node.routes.regional_routing.fallback_regions", map[string][]string{
+		"DEU": {"NL"},
+	})
+
+	err := validateServerConfig()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "must be a two-letter ISO country code")
+}
+
+func TestRegionalRegionCode(t *testing.T) {
+	for _, tt := range []struct {
+		value string
+		valid bool
+	}{
+		{value: "DE", valid: true},
+		{value: "de", valid: true},
+		{value: "DERP-10", valid: true},
+		{value: "derp-10", valid: true},
+		{value: "DERP-0", valid: false},
+		{value: "DERP-nope", valid: false},
+		{value: "DEU", valid: false},
+	} {
+		t.Run(tt.value, func(t *testing.T) {
+			assert.Equal(t, tt.valid, isRegionalRegionCode(tt.value))
+		})
+	}
+}
+
+func TestValidateServerConfigRejectsNegativeGeoIPUpdateInterval(t *testing.T) {
+	viper.Reset()
+	t.Cleanup(viper.Reset)
+	viper.Set("prefixes.v4", "100.64.0.0/10")
+	viper.Set("prefixes.v6", "fd7a:115c:a1e0::/48")
+	viper.Set("server_url", "http://127.0.0.1:8080")
+	viper.Set("noise.private_key_path", "noise.key")
+	viper.Set("dns.override_local_dns", false)
+	viper.Set("node.ephemeral.inactivity_timeout", "120s")
+	viper.Set("geoip.update_interval", "-1s")
+
+	err := validateServerConfig()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "geoip.update_interval must not be negative")
 }
 
 func TestReadConfigFromEnv(t *testing.T) {

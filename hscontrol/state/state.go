@@ -26,6 +26,7 @@ import (
 
 	"github.com/hashicorp/golang-lru/v2/expirable"
 	hsdb "github.com/juanfont/headscale/hscontrol/db"
+	"github.com/juanfont/headscale/hscontrol/geoip"
 	"github.com/juanfont/headscale/hscontrol/policy"
 	"github.com/juanfont/headscale/hscontrol/policy/matcher"
 	"github.com/juanfont/headscale/hscontrol/types"
@@ -154,6 +155,13 @@ type State struct {
 	ipAlloc *hsdb.IPAllocator
 	// derpMap contains the current DERP relay configuration
 	derpMap atomic.Pointer[tailcfg.DERPMap]
+	// geoIP provides ephemeral endpoint-to-country lookups for regional routing.
+	geoIP geoIPLookupCloser
+
+	// regionalRTT stores the latest client-reported DERP measurements without
+	// persisting transport jitter to the node database.
+	regionalMu  sync.RWMutex
+	regionalRTT map[types.NodeID]map[int]float64
 	// polMan handles policy evaluation and management
 	polMan policy.PolicyManager
 
@@ -301,6 +309,16 @@ func NewState(cfg *types.Config) (*State, error) {
 
 		sshCheckAuth:  make(map[sshCheckPair]time.Time),
 		registerLocks: xsync.NewMap[key.MachinePublic, *sync.Mutex](),
+		regionalRTT:   make(map[types.NodeID]map[int]float64),
+	}
+
+	if cfg.GeoIP.Enabled {
+		reader, err := geoip.Open(cfg.GeoIP)
+		if err != nil {
+			log.Warn().Err(err).Msg("GeoIP unavailable; regional routing will use DERP regions")
+		} else {
+			s.geoIP = reader
+		}
 	}
 
 	// Surface nodes whose stored data would break map generation (e.g. an
@@ -315,13 +333,20 @@ func NewState(cfg *types.Config) (*State, error) {
 func (s *State) Close() error {
 	s.pings.drain()
 	s.nodeStore.Stop()
+	var closeErr error
+	if s.geoIP != nil {
+		closeErr = s.geoIP.Close()
+	}
 
 	err := s.db.Close()
 	if err != nil {
-		return fmt.Errorf("closing database: %w", err)
+		err = fmt.Errorf("closing database: %w", err)
+	}
+	if closeErr != nil {
+		closeErr = fmt.Errorf("closing GeoIP reader: %w", closeErr)
 	}
 
-	return nil
+	return errors.Join(closeErr, err)
 }
 
 // SetDERPMap updates the DERP relay configuration.
@@ -622,6 +647,7 @@ func (s *State) DeleteNode(node types.NodeView) (change.Change, error) {
 	// node after its row is gone so a failed database write cannot make a live
 	// node look deleted until the next restart.
 	s.nodeStore.DeleteNode(node.ID())
+	s.clearRegionalRTT(node.ID())
 	s.persistMu.Unlock()
 
 	s.ipAlloc.FreeIPs(node.IPs())
@@ -1289,6 +1315,41 @@ func (s *State) GetNodePrimaryRoutes(nodeID types.NodeID) []netip.Prefix {
 	return s.nodeStore.PrimaryRoutesForNode(nodeID)
 }
 
+// PrimaryRoutesForViewer returns the prefixes this node serves in its own
+// regional assignment, together with unchanged global-primary prefixes.
+func (s *State) PrimaryRoutesForViewer(viewer types.NodeView) []netip.Prefix {
+	regional := s.RegionalPrimaryRoutesForViewer(viewer)
+	return s.PrimaryRoutesForViewerWithRegional(viewer, regional)
+}
+
+// PrimaryRoutesForViewerWithRegional applies a precomputed regional assignment
+// to the viewer's global primary routes.
+func (s *State) PrimaryRoutesForViewerWithRegional(
+	viewer types.NodeView,
+	regional map[netip.Prefix]types.NodeID,
+) []netip.Prefix {
+	global := s.nodeStore.PrimaryRoutesForNode(viewer.ID())
+	result := make([]netip.Prefix, 0, len(global)+len(regional))
+	for _, prefix := range global {
+		if _, isRegional := regional[prefix]; !isRegional {
+			result = append(result, prefix)
+		}
+	}
+	for prefix, nodeID := range regional {
+		if nodeID == viewer.ID() {
+			result = append(result, prefix)
+		}
+	}
+
+	return result
+}
+
+// RegionalPrimaryRoutesForViewer computes regional owners once for a viewer's
+// full map response. The returned map is a fresh value owned by the caller.
+func (s *State) RegionalPrimaryRoutesForViewer(viewer types.NodeView) map[netip.Prefix]types.NodeID {
+	return s.regionalPrimaryRoutes(viewer)
+}
+
 // RoutesForPeer computes the routes a peer should advertise in a viewer's
 // AllowedIPs, combining primary routes (from HA election), approved exit
 // routes, and via grant steering.
@@ -1300,21 +1361,47 @@ func (s *State) RoutesForPeer(
 	viewer, peer types.NodeView,
 	matchers []matcher.Match,
 ) []netip.Prefix {
+	return s.RoutesForPeerWithRegionalPrimaries(
+		viewer,
+		peer,
+		matchers,
+		s.regionalPrimaryRoutes(viewer),
+	)
+}
+
+// RoutesForPeerWithRegionalPrimaries computes one peer's advertised routes
+// using the per-viewer route assignments precomputed for a map response.
+func (s *State) RoutesForPeerWithRegionalPrimaries(
+	viewer, peer types.NodeView,
+	matchers []matcher.Match,
+	regionalPrimaries map[netip.Prefix]types.NodeID,
+) []netip.Prefix {
 	viaResult := s.polMan.ViaRoutesForPeer(viewer, peer)
 	globalPrimaries := s.nodeStore.PrimaryRoutesForNode(peer.ID())
+	peerPrimaries := make([]netip.Prefix, 0, len(globalPrimaries)+len(regionalPrimaries))
+	for _, prefix := range globalPrimaries {
+		if _, regional := regionalPrimaries[prefix]; !regional {
+			peerPrimaries = append(peerPrimaries, prefix)
+		}
+	}
+	for prefix, id := range regionalPrimaries {
+		if id == peer.ID() {
+			peerPrimaries = append(peerPrimaries, prefix)
+		}
+	}
 	exitRoutes := peer.ExitRoutes()
 
 	var reduced []netip.Prefix
 
 	// Fast path: no via grants affect this pair.
 	if len(viaResult.Include) == 0 && len(viaResult.Exclude) == 0 {
-		allRoutes := slices.Concat(globalPrimaries, exitRoutes)
+		allRoutes := slices.Concat(peerPrimaries, exitRoutes)
 
 		reduced = policy.ReduceRoutes(viewer, allRoutes, matchers)
 	} else {
 		// Slow path: drop excluded routes, reduce, append via-included.
-		routes := make([]netip.Prefix, 0, len(globalPrimaries)+len(exitRoutes))
-		for _, p := range slices.Concat(globalPrimaries, exitRoutes) {
+		routes := make([]netip.Prefix, 0, len(peerPrimaries)+len(exitRoutes))
+		for _, p := range slices.Concat(peerPrimaries, exitRoutes) {
 			if !slices.Contains(viaResult.Exclude, p) {
 				routes = append(routes, p)
 			}
@@ -1337,7 +1424,7 @@ func (s *State) RoutesForPeer(
 				continue
 			}
 
-			if slices.Contains(globalPrimaries, p) {
+			if slices.Contains(peerPrimaries, p) {
 				reduced = append(reduced, p)
 			} else if !slices.Contains(viaResult.UsePrimary, p) {
 				reduced = append(reduced, p)
@@ -1351,7 +1438,7 @@ func (s *State) RoutesForPeer(
 	// know which peer is primary for their shared prefix.
 	viewerSubnets := viewer.SubnetRoutes()
 	if len(viewerSubnets) > 0 {
-		for _, p := range globalPrimaries {
+		for _, p := range peerPrimaries {
 			if slices.Contains(viewerSubnets, p) && !slices.Contains(reduced, p) {
 				reduced = append(reduced, p)
 			}
@@ -1359,6 +1446,66 @@ func (s *State) RoutesForPeer(
 	}
 
 	return reduced
+}
+
+// regionalPrimaryRoutes returns per-viewer owners for overlapping subnet
+// prefixes. Unknown regions retain the existing global primary assignment.
+func (s *State) regionalPrimaryRoutes(viewer types.NodeView) map[netip.Prefix]types.NodeID {
+	return s.regionalPrimaryRoutesWithRTT(viewer, s.regionalRTTFor(viewer.ID()))
+}
+
+func (s *State) regionalPrimaryRoutesWithRTT(
+	viewer types.NodeView,
+	rtt map[int]float64,
+) map[netip.Prefix]types.NodeID {
+	selected := make(map[netip.Prefix]types.NodeID)
+	if !viewer.Valid() {
+		return selected
+	}
+	viewerRegion := s.routingRegionWithRTT(viewer, rtt)
+	if viewerRegion == "" {
+		return selected
+	}
+
+	for prefix, ids := range s.nodeStore.HANodes() {
+		candidates := make([]RegionalRouteCandidate, 0, len(ids))
+		for _, id := range ids {
+			router, ok := s.GetNodeByID(id)
+			if !ok {
+				continue
+			}
+			candidates = append(candidates, RegionalRouteCandidate{
+				NodeID:   id,
+				Country:  s.routerRoutingRegion(router, rtt),
+				HomeDERP: nodeHomeDERP(router),
+				Healthy:  !router.Unhealthy(),
+			})
+		}
+		if len(candidates) < 2 {
+			continue
+		}
+
+		previous, _ := s.nodeStore.PrimaryRouteFor(prefix)
+		fallback := s.regionalFallbacks(viewerRegion)
+		if id, ok := SelectRegionalRoute(viewerRegion, candidates, rtt, previous, fallback); ok {
+			selected[prefix] = id
+		}
+	}
+
+	return selected
+}
+
+func (s *State) regionalFallbacks(region string) []string {
+	if s.cfg == nil {
+		return nil
+	}
+	for configuredRegion, fallbacks := range s.cfg.Node.Routes.RegionalRouting.FallbackRegions {
+		if strings.EqualFold(configuredRegion, region) {
+			return fallbacks
+		}
+	}
+
+	return nil
 }
 
 // PrimaryRoutesString renders the current prefix→primary assignment
@@ -1532,6 +1679,7 @@ func (s *State) PutNodeInStoreForTest(node types.Node) types.NodeView {
 // failures in poll-session tests while keeping the DB row intact for later restore.
 func (s *State) DeleteNodeFromStoreForTest(id types.NodeID) {
 	s.nodeStore.DeleteNode(id)
+	s.clearRegionalRTT(id)
 }
 
 // CreateRegisteredNodeForTest creates a test node with allocated IPs. This is a convenience wrapper around the database layer.
@@ -3027,7 +3175,10 @@ func (s *State) UpdateNodeFromMapRequest(id types.NodeID, req tailcfg.MapRequest
 		routeChange        bool
 		needsRouteApproval bool
 		autoApprovedRoutes []netip.Prefix
+		requestedNetInfo   *tailcfg.NetInfo
 	)
+	oldViewer, _ := s.GetNodeByID(id)
+	oldRegionalRTT := s.regionalRTTFor(id)
 	// Snapshot the primary assignment so we can tell whether the
 	// Hostinfo + auto-approval that follows shifted any prefix.
 	prevRoutes := s.nodeStore.PrimaryRoutes()
@@ -3056,6 +3207,7 @@ func (s *State) UpdateNodeFromMapRequest(id types.NodeID, req tailcfg.MapRequest
 			hi := *req.Hostinfo
 			hi.NetInfo = netInfoFromMapRequest(id, currentNode.Hostinfo, req.Hostinfo)
 			newHostinfo = &hi
+			requestedNetInfo = req.Hostinfo.NetInfo
 		}
 
 		// DERP comparison is independent of the rest of Hostinfo:
@@ -3193,6 +3345,18 @@ func (s *State) UpdateNodeFromMapRequest(id types.NodeID, req tailcfg.MapRequest
 		return change.Change{}, fmt.Errorf("%w: %d", ErrNodeNotInNodeStore, id)
 	}
 
+	rttChanged := s.setRegionalRTT(id, requestedNetInfo)
+	geoEndpointsChanged := s.geoIP != nil && delta.peerChange.Endpoints != nil
+	regionalInputsChanged := rttChanged || delta.derpChanged || geoEndpointsChanged
+	regionalRouteChanged := false
+	if regionalInputsChanged && oldViewer.Valid() {
+		oldRegionalRoutes := s.regionalPrimaryRoutesWithRTT(oldViewer, oldRegionalRTT)
+		newRegionalRoutes := s.regionalPrimaryRoutes(updatedNode)
+		regionalRouteChanged = !maps.Equal(oldRegionalRoutes, newRegionalRoutes)
+	}
+	regionalRouterChanged := (delta.derpChanged || geoEndpointsChanged) &&
+		((oldViewer.Valid() && len(oldViewer.SubnetRoutes()) > 0) || len(updatedNode.SubnetRoutes()) > 0)
+
 	if routeChange {
 		log.Debug().
 			Uint64(zf.NodeID, id.Uint64()).
@@ -3268,6 +3432,17 @@ func (s *State) UpdateNodeFromMapRequest(id types.NodeID, req tailcfg.MapRequest
 
 	if !nodeRouteChange.IsEmpty() {
 		return nodeRouteChange, nil
+	}
+	if regionalRouterChanged {
+		return change.PolicyChange(), nil
+	}
+	if regionalRouteChanged {
+		if delta.derpChanged || geoEndpointsChanged {
+			// The requester's regional map must be rebuilt, while peers also
+			// need the requester's new DERP region or direct endpoints.
+			return change.PolicyChange(), nil
+		}
+		return change.FullSelf(id), nil
 	}
 
 	// Determine the most specific change type from the classified delta.

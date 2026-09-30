@@ -413,13 +413,33 @@ func TestMapRequestOmittedNetInfoIsNoChange(t *testing.T) {
 		Hostinfo: &tailcfg.Hostinfo{
 			Hostname: stored.Hostname,
 			OS:       "linux",
-			NetInfo:  &tailcfg.NetInfo{PreferredDERP: 1},
+			NetInfo: &tailcfg.NetInfo{
+				PreferredDERP: 1,
+				DERPLatency:   map[string]float64{"1-v4": 0.010},
+			},
 		},
 	})
 	require.NoError(t, err)
 	require.Positive(t, nodeUpdateCount.Load(), "first request must persist")
 
 	nodeUpdateCount.Store(0)
+
+	// A latency-only sample updates the runtime selector but is not persisted.
+	_, err = s.UpdateNodeFromMapRequest(nodeID, tailcfg.MapRequest{
+		NodeKey:  stored.NodeKey,
+		DiscoKey: stored.DiscoKey,
+		Hostinfo: &tailcfg.Hostinfo{
+			Hostname: stored.Hostname,
+			OS:       "linux",
+			NetInfo: &tailcfg.NetInfo{
+				PreferredDERP: 1,
+				DERPLatency:   map[string]float64{"1-v4": 0.025},
+			},
+		},
+	})
+	require.NoError(t, err)
+	require.Equal(t, map[int]float64{1: 0.025}, s.regionalRTTFor(nodeID))
+	require.Zero(t, nodeUpdateCount.Load(), "RTT-only updates must stay in memory")
 
 	// Same Hostinfo, NetInfo omitted: the client is saying "unchanged".
 	c, err := s.UpdateNodeFromMapRequest(nodeID, tailcfg.MapRequest{
@@ -440,6 +460,8 @@ func TestMapRequestOmittedNetInfoIsNoChange(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, int(1), hostinfoDERP(after.AsStruct().Hostinfo),
 		"stored NetInfo must survive a request that omits it")
+	require.Equal(t, map[int]float64{1: 0.025}, s.regionalRTTFor(nodeID),
+		"omitted NetInfo must not replace the runtime RTT with stale persisted data")
 }
 
 // TestMapRequestDERPClearToZeroIsStoredAndBroadcast pins that a node reporting

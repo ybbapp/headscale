@@ -39,3 +39,38 @@
         # Version {{ headscale.version }}
         curl -o config.yaml https://raw.githubusercontent.com/juanfont/headscale/v{{ headscale.version }}/config-example.yaml
         ```
+
+## GeoIP
+
+GeoIP country lookup is optional and disabled by default. When enabled,
+Headscale reads a MaxMind DB (MMDB) country database from `geoip.database_path`.
+Only globally routable public addresses are eligible for lookup; private,
+loopback, link-local, and reserved addresses return no country.
+
+```yaml
+geoip:
+  enabled: true
+  database_path: /var/lib/headscale/GeoLite2-Country.mmdb
+  source_url: https://raw.githubusercontent.com/P3TERX/GeoLite.mmdb/download/GeoLite2-Country.mmdb
+  update_interval: 72h
+```
+
+`source_url` defaults to the P3TERX GeoLite2 Country mirror. Headscale attempts
+a download at startup and then at `update_interval`; failed or invalid updates
+leave the last valid database in use. Configure a different source URL if your
+deployment uses another provider. Without a valid local database or successful
+download, GeoIP lookups return no country and regional routing falls back to
+DERP RTT.
+
+Regional router fallback order is optional and configured by viewer country
+when GeoIP is active, or by `DERP-<region-id>` when using RTT regions. Country
+codes are two-letter ISO 3166-1 alpha-2 values. Entries are tried in the listed
+order when the viewer's country or DERP region has no healthy router.
+
+```yaml
+node:
+  routes:
+    regional_routing:
+      fallback_regions:
+        DE: [FR, NL]
+```

@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -78,7 +79,21 @@ type HARouteConfig struct {
 
 // RouteConfig contains configuration for route behaviour.
 type RouteConfig struct {
-	HA HARouteConfig
+	HA              HARouteConfig
+	RegionalRouting RegionalRoutingConfig
+}
+
+// RegionalRoutingConfig controls regional subnet-router fallback order.
+type RegionalRoutingConfig struct {
+	FallbackRegions map[string][]string
+}
+
+// GeoIPConfig controls local IP-to-country lookups.
+type GeoIPConfig struct {
+	Enabled        bool
+	DatabasePath   string
+	SourceURL      string
+	UpdateInterval time.Duration
 }
 
 // NodeConfig contains configuration for node lifecycle and expiry.
@@ -116,6 +131,8 @@ type Config struct {
 	Database DatabaseConfig
 
 	DERP DERPConfig
+
+	GeoIP GeoIPConfig
 
 	TLS TLSConfig
 
@@ -479,6 +496,11 @@ func LoadConfig(path string, isFile bool) error {
 	viper.SetDefault("node.ephemeral.inactivity_timeout", "120s")
 	viper.SetDefault("node.routes.ha.probe_interval", "10s")
 	viper.SetDefault("node.routes.ha.probe_timeout", "5s")
+	viper.SetDefault("node.routes.regional_routing.fallback_regions", map[string][]string{})
+	viper.SetDefault("geoip.enabled", false)
+	viper.SetDefault("geoip.database_path", "/var/lib/headscale/GeoLite2-Country.mmdb")
+	viper.SetDefault("geoip.source_url", "https://raw.githubusercontent.com/P3TERX/GeoLite.mmdb/download/GeoLite2-Country.mmdb")
+	viper.SetDefault("geoip.update_interval", "72h")
 
 	viper.SetDefault("tuning.notifier_send_timeout", "800ms")
 	viper.SetDefault("tuning.batch_change_delay", "800ms")
@@ -679,6 +701,29 @@ func validateServerConfig() error {
 				haTimeout,
 				haInterval,
 			)
+		}
+	}
+
+	if interval := viper.GetDuration("geoip.update_interval"); interval < 0 {
+		errorText += "Fatal config error: geoip.update_interval must not be negative\n"
+	}
+
+	for region, fallbacks := range viper.GetStringMapStringSlice(
+		"node.routes.regional_routing.fallback_regions",
+	) {
+		if !isRegionalRegionCode(region) {
+			errorText += fmt.Sprintf(
+				"Fatal config error: node.routes.regional_routing.fallback_regions key %q must be a two-letter ISO country code or DERP-<region-id>\n",
+				region,
+			)
+		}
+		for _, fallback := range fallbacks {
+			if !isRegionalRegionCode(fallback) {
+				errorText += fmt.Sprintf(
+					"Fatal config error: node.routes.regional_routing.fallback_regions value %q must be a two-letter ISO country code or DERP-<region-id>\n",
+					fallback,
+				)
+			}
 		}
 	}
 
@@ -1272,7 +1317,18 @@ func LoadServerConfig() (*Config, error) {
 					ProbeInterval: viper.GetDuration("node.routes.ha.probe_interval"),
 					ProbeTimeout:  viper.GetDuration("node.routes.ha.probe_timeout"),
 				},
+				RegionalRouting: RegionalRoutingConfig{
+					FallbackRegions: viper.GetStringMapStringSlice(
+						"node.routes.regional_routing.fallback_regions",
+					),
+				},
 			},
+		},
+		GeoIP: GeoIPConfig{
+			Enabled:        viper.GetBool("geoip.enabled"),
+			DatabasePath:   util.AbsolutePathFromConfigPath(viper.GetString("geoip.database_path")),
+			SourceURL:      viper.GetString("geoip.source_url"),
+			UpdateInterval: viper.GetDuration("geoip.update_interval"),
 		},
 
 		Database: databaseConfig(),
@@ -1346,6 +1402,30 @@ func LoadServerConfig() (*Config, error) {
 			NodeStoreBatchTimeout:   viper.GetDuration("tuning.node_store_batch_timeout"),
 		},
 	}, nil
+}
+
+func isCountryCode(value string) bool {
+	if len(value) != 2 {
+		return false
+	}
+	for _, char := range value {
+		if (char < 'A' || char > 'Z') && (char < 'a' || char > 'z') {
+			return false
+		}
+	}
+	return true
+}
+
+func isRegionalRegionCode(value string) bool {
+	if isCountryCode(value) {
+		return true
+	}
+	region, ok := strings.CutPrefix(strings.ToUpper(value), "DERP-")
+	if !ok {
+		return false
+	}
+	id, err := strconv.Atoi(region)
+	return err == nil && id > 0
 }
 
 // BaseDomain cannot be a suffix of the server URL.

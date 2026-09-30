@@ -24,6 +24,9 @@ type MapResponseBuilder struct {
 	capVer tailcfg.CapabilityVersion
 	errs   []error
 
+	regionalPrimariesSet bool
+	regionalPrimaries    map[netip.Prefix]types.NodeID
+
 	debugType debugType
 }
 
@@ -83,7 +86,8 @@ func (b *MapResponseBuilder) WithSelfNode() *MapResponseBuilder {
 		b.capVer,
 		func(id types.NodeID) []netip.Prefix {
 			// Self node: include own primaries + exit routes (no via steering for self).
-			primaries := policy.ReduceRoutes(nv, b.mapper.state.GetNodePrimaryRoutes(id), matchers)
+			regional := b.regionalRoutesForViewer(nv)
+			primaries := policy.ReduceRoutes(nv, b.mapper.state.PrimaryRoutesForViewerWithRegional(nv, regional), matchers)
 
 			return slices.Concat(primaries, nv.ExitRoutes())
 		},
@@ -265,6 +269,7 @@ func (b *MapResponseBuilder) buildTailPeers(peers views.Slice[types.NodeView]) (
 	// instead of locking the policy manager per peer. The per-call
 	// path used to take pm.mu N times for an N-peer response.
 	allCapMaps := b.mapper.state.NodeCapMaps()
+	regionalPrimaries := b.regionalRoutesForViewer(node)
 
 	// Build tail nodes with per-peer via-aware route function.
 	tailPeers := make([]*tailcfg.Node, 0, peers.Len())
@@ -276,7 +281,12 @@ func (b *MapResponseBuilder) buildTailPeers(peers views.Slice[types.NodeView]) (
 		// overwritten by the PeerCapMap call below; only the address
 		// filtering side-effect inside TailNode survives.
 		tn, err := peer.TailNode(b.capVer, func(_ types.NodeID) []netip.Prefix {
-			return b.mapper.state.RoutesForPeer(node, peer, matchers)
+			return b.mapper.state.RoutesForPeerWithRegionalPrimaries(
+				node,
+				peer,
+				matchers,
+				regionalPrimaries,
+			)
 		}, b.mapper.cfg, allCapMaps[peer.ID()])
 		if err != nil {
 			// One peer with invalid data (e.g. an empty or over-long
@@ -314,6 +324,15 @@ func (b *MapResponseBuilder) buildTailPeers(peers views.Slice[types.NodeView]) (
 	})
 
 	return tailPeers, nil
+}
+
+func (b *MapResponseBuilder) regionalRoutesForViewer(viewer types.NodeView) map[netip.Prefix]types.NodeID {
+	if !b.regionalPrimariesSet {
+		b.regionalPrimaries = b.mapper.state.RegionalPrimaryRoutesForViewer(viewer)
+		b.regionalPrimariesSet = true
+	}
+
+	return b.regionalPrimaries
 }
 
 // WithPingRequest adds a PingRequest to the response.

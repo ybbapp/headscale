@@ -24,6 +24,7 @@ require (
 	github.com/hashicorp/golang-lru/v2 v2.0.7
 	github.com/jagottsicher/termcolor v1.0.2
 	github.com/oauth2-proxy/mockoidc v0.0.0-20240214162133-caebfff84d25
+	github.com/oschwald/maxminddb-golang v1.13.1
 	github.com/ory/dockertest/v3 v3.12.0
 	github.com/philip-bui/grpc-zerolog v1.0.1
 	github.com/pkg/profile v1.7.0
