@@ -1,4 +1,5 @@
 ignored/
+hs-test-client-state/
 tailscale/
 .vscode/
 .claude/
